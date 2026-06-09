@@ -1,2 +1,0 @@
-gola
-evuse fuchibol
