@@ -1,0 +1,6 @@
+static void bt_send(const char *msg)
+static void esp_bt_gap_cb(...)
+static void esp_spp_cb(...)
+static void bluetooth_init(void)
+static void process_bt_command(char cmd)
+static void print_info(float freq)
