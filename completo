@@ -1,0 +1,365 @@
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_task_wdt.h"
+#include "nvs_flash.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_bt_api.h"
+#include "esp_bt_device.h"
+#include "esp_spp_api.h"
+
+static const char *TAG = "SPWM";
+
+#define PIN_A           GPIO_NUM_18
+#define PIN_B           GPIO_NUM_21
+
+#define BTN_POWER       GPIO_NUM_26
+#define BTN_START_STOP  GPIO_NUM_32
+#define BTN_FREQ_UP     GPIO_NUM_33
+#define BTN_FREQ_DOWN   GPIO_NUM_27
+
+#define TRIANGLE_FREQ   3000.0f
+#define FREQ_MIN        20.0f
+#define FREQ_MAX        200.0f
+#define FREQ_STEP       5.0f
+#define DEAD_TIME_US    3
+#define MA              1.0f
+#define PI_2            6.28318530718f
+#define DEBOUNCE_MS     200
+
+static volatile float g_freq = 60.0f;
+static volatile bool g_running = false;
+static volatile bool g_power = false;
+
+static uint32_t spp_handle = 0;
+
+// Prototipos
+static void process_bt_command(char cmd);
+static void stop_output(void);
+static void bt_send(const char *msg);
+static inline void update_bridge(bool state);
+static void print_info(float freq);
+
+// =============================================
+//          FUNCIONES AUXILIARES
+// =============================================
+
+static void stop_output(void)
+{
+    gpio_set_level(PIN_A, 0);
+    gpio_set_level(PIN_B, 0);
+}
+
+static void bt_send(const char *msg)
+{
+    if (spp_handle != 0) {
+        esp_spp_write(spp_handle, strlen(msg), (uint8_t *)msg);
+    }
+}
+
+static inline void update_bridge(bool state)
+{
+    gpio_set_level(PIN_A, 0);
+    gpio_set_level(PIN_B, 0);
+    esp_rom_delay_us(DEAD_TIME_US);
+
+    if (state)
+        gpio_set_level(PIN_A, 1);
+    else
+        gpio_set_level(PIN_B, 1);
+}
+
+// =============================================
+//          BLUETOOTH
+// =============================================
+
+static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    if (event == ESP_BT_GAP_AUTH_CMPL_EVT) {
+        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(TAG, "Bluetooth autenticado");
+        }
+    }
+}
+
+static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_SPP_INIT_EVT:
+            esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, "SPWM_ESP32");
+            break;
+
+        case ESP_SPP_SRV_OPEN_EVT:
+            spp_handle = param->srv_open.handle;
+            ESP_LOGI(TAG, "Celular conectado por Bluetooth");
+            bt_send("=== SPWM ESP32 conectado ===\r\n");
+            bt_send("p=power | s=start | +=subir | -=bajar | ?=estado\r\n");
+            break;
+
+        case ESP_SPP_CLOSE_EVT:
+            spp_handle = 0;
+            ESP_LOGI(TAG, "Bluetooth desconectado");
+            break;
+
+        case ESP_SPP_DATA_IND_EVT:
+            for (int i = 0; i < param->data_ind.len; i++) {
+                process_bt_command((char)param->data_ind.data[i]);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void bluetooth_init(void)
+{
+    esp_err_t ret;
+
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    bt_cfg.mode = ESP_BT_MODE_CLASSIC_BT;
+    bt_cfg.bt_max_acl_conn = 1;
+    bt_cfg.bt_max_sync_conn = 1;
+
+    ret = esp_bt_controller_init(&bt_cfg);
+    ESP_ERROR_CHECK(ret);
+
+    ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    ESP_ERROR_CHECK(ret);
+
+    ret = esp_bluedroid_init();
+    ESP_ERROR_CHECK(ret);
+
+    ret = esp_bluedroid_enable();
+    ESP_ERROR_CHECK(ret);
+
+    esp_bt_gap_register_callback(esp_bt_gap_cb);
+    esp_spp_register_callback(esp_spp_cb);
+
+    esp_spp_cfg_t spp_cfg = {
+        .mode = ESP_SPP_MODE_CB,
+        .enable_l2cap_ertm = false,
+        .tx_buffer_size = 1024,
+    };
+    ret = esp_spp_enhanced_init(&spp_cfg);
+    ESP_ERROR_CHECK(ret);
+
+    esp_bt_gap_set_device_name("SPWM_ESP32");
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+    ESP_LOGI(TAG, "Bluetooth inicializado correctamente - busca 'SPWM_ESP32'");
+}
+
+// =============================================
+//          TAREA SPWM
+// =============================================
+
+static void spwm_task(void *pvParameters)
+{
+    float phase_sine = 0.0f;
+    float phase_tri = 0.0f;
+    bool was_running = false;
+    int64_t last_time = 0;
+
+    while (1) {
+        if (!g_power || !g_running) {
+            if (was_running) stop_output();
+            was_running = false;
+            last_time = 0;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        was_running = true;
+
+        int64_t now = esp_timer_get_time();
+        if (last_time == 0) last_time = now;
+
+        float dt = (now - last_time) * 1e-6f;
+        last_time = now;
+
+        phase_sine = fmodf(phase_sine + PI_2 * g_freq * dt, PI_2);
+        phase_tri = fmodf(phase_tri + TRIANGLE_FREQ * dt, 1.0f);
+
+        float sine = MA * sinf(phase_sine);
+        float tri = (phase_tri < 0.5f) ? (4.0f * phase_tri - 1.0f) : (3.0f - 4.0f * phase_tri);
+
+        update_bridge(sine > tri);
+
+        taskYIELD();
+    }
+}
+
+// =============================================
+//          COMANDOS BLUETOOTH
+// =============================================
+
+static void process_bt_command(char cmd)
+{
+    char buf[64];
+
+    switch (cmd) {
+        case 'p': case 'P':
+            g_power = !g_power;
+            if (!g_power) {
+                g_running = false;
+                stop_output();
+                bt_send("[POWER] APAGADO\r\n");
+            } else {
+                bt_send("[POWER] ENCENDIDO\r\n");
+                print_info(g_freq);
+            }
+            break;
+
+        case 's': case 'S':
+            if (!g_power) {
+                bt_send("! Presiona P primero\r\n");
+            } else {
+                g_running = !g_running;
+                if (g_running)
+                    snprintf(buf, sizeof(buf), "[START] %.1f Hz\r\n", g_freq);
+                else
+                    snprintf(buf, sizeof(buf), "[STOP] DETENIDO\r\n");
+                bt_send(buf);
+            }
+            break;
+
+        case '+': case 'u': case 'U':
+            if (g_freq < FREQ_MAX) g_freq += FREQ_STEP;
+            snprintf(buf, sizeof(buf), "[F+] %.1f Hz\r\n", g_freq);
+            bt_send(buf);
+            break;
+
+        case '-': case 'd': case 'D':
+            if (g_freq > FREQ_MIN) g_freq -= FREQ_STEP;
+            snprintf(buf, sizeof(buf), "[F-] %.1f Hz\r\n", g_freq);
+            bt_send(buf);
+            break;
+
+        case '?':
+            snprintf(buf, sizeof(buf), "PWR=%d RUN=%d FREQ=%.1f Hz\r\n", g_power, g_running, g_freq);
+            bt_send(buf);
+            break;
+
+        default:
+            bt_send("Cmd: p s + - ?\r\n");
+            break;
+    }
+}
+
+static void print_info(float freq)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf), "=== %.1f Hz | %.0f pulsos/ciclo ===\r\n", freq, TRIANGLE_FREQ / freq);
+    bt_send(buf);
+}
+
+// =============================================
+//          TAREAS
+// =============================================
+
+static void button_task(void *pvParameters)
+{
+    int64_t last_p = 0, last_s = 0, last_up = 0, last_down = 0;
+
+    while (1) {
+        int64_t now = esp_timer_get_time() / 1000;
+
+        if (gpio_get_level(BTN_POWER) == 0 && (now - last_p) > DEBOUNCE_MS) {
+            last_p = now;
+            g_power = !g_power;
+            if (!g_power) {
+                g_running = false;
+                stop_output();
+                bt_send("[POWER] APAGADO\r\n");
+            } else {
+                bt_send("[POWER] ENCENDIDO\r\n");
+            }
+        }
+
+        if (gpio_get_level(BTN_START_STOP) == 0 && (now - last_s) > DEBOUNCE_MS) {
+            last_s = now;
+            if (g_power) {
+                g_running = !g_running;
+                bt_send(g_running ? "[START] ON\r\n" : "[STOP] OFF\r\n");
+            }
+        }
+
+        if (gpio_get_level(BTN_FREQ_UP) == 0 && (now - last_up) > DEBOUNCE_MS) {
+            last_up = now;
+            if (g_freq < FREQ_MAX) g_freq += FREQ_STEP;
+        }
+
+        if (gpio_get_level(BTN_FREQ_DOWN) == 0 && (now - last_down) > DEBOUNCE_MS) {
+            last_down = now;
+            if (g_freq > FREQ_MIN) g_freq -= FREQ_STEP;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void debug_task(void *pvParameters)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        char buf[80];
+        snprintf(buf, sizeof(buf), "F=%.1fHz PWR=%d RUN=%d\r\n", g_freq, g_power, g_running);
+        bt_send(buf);
+    }
+}
+
+static void gpio_setup(void)
+{
+    gpio_config_t out = {
+        .pin_bit_mask = (1ULL << PIN_A) | (1ULL << PIN_B),
+        .mode = GPIO_MODE_OUTPUT
+    };
+    gpio_config(&out);
+    stop_output();
+
+    gpio_config_t btn = {
+        .pin_bit_mask = (1ULL << BTN_POWER) | (1ULL << BTN_START_STOP) |
+                        (1ULL << BTN_FREQ_UP) | (1ULL << BTN_FREQ_DOWN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE
+    };
+    gpio_config(&btn);
+
+    ESP_LOGI(TAG, "GPIO listo");
+}
+
+// =============================================
+//          MAIN
+// =============================================
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "================================");
+    ESP_LOGI(TAG, "  Inversor Monofasico SPWM");
+    ESP_LOGI(TAG, "================================");
+
+    esp_task_wdt_deinit();
+    gpio_setup();
+    bluetooth_init();
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    xTaskCreatePinnedToCore(spwm_task,   "spwm",   4096, NULL, 9, NULL, 1);
+    xTaskCreatePinnedToCore(button_task, "btn",    3072, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(debug_task,  "debug",  2048, NULL, 2, NULL, 0);
+}
